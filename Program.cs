@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
+using Npgsql;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
@@ -7,7 +8,29 @@ using System.Text;
 var builder = WebApplication.CreateBuilder(args);
 
 var jwtKey = Environment.GetEnvironmentVariable("JWT_KEY")
-    ?? throw new InvalidOperationException("JWT_KEY environment variable is not configured.");
+    ?? throw new InvalidOperationException(
+        "JWT_KEY environment variable is not configured.");
+
+var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL")
+    ?? throw new InvalidOperationException(
+        "DATABASE_URL environment variable is not configured.");
+
+var databaseUri = new Uri(databaseUrl);
+
+var userInfo = databaseUri.UserInfo.Split(':', 2);
+
+var connectionStringBuilder = new NpgsqlConnectionStringBuilder
+{
+    Host = databaseUri.Host,
+    Port = databaseUri.Port > 0 ? databaseUri.Port : 5432,
+    Username = Uri.UnescapeDataString(userInfo[0]),
+    Password = userInfo.Length > 1
+        ? Uri.UnescapeDataString(userInfo[1])
+        : "",
+    Database = databaseUri.AbsolutePath.TrimStart('/')
+};
+
+var connectionString = connectionStringBuilder.ConnectionString;
 
 builder.Services.AddCors(options =>
 {
@@ -42,6 +65,30 @@ app.UseCors("AllowAngular");
 app.UseAuthentication();
 app.UseAuthorization();
 
+/*
+ * Create the users table automatically if it does not exist.
+ * User accounts are now stored in PostgreSQL instead of memory.
+ */
+await using (var connection = new NpgsqlConnection(connectionString))
+{
+    await connection.OpenAsync();
+
+    var createTableCommand = new NpgsqlCommand(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username VARCHAR(100) NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL
+        );
+        """,
+        connection);
+
+    await createTableCommand.ExecuteNonQueryAsync();
+}
+
+/*
+ * Books are still stored in memory for this demo.
+ */
 var books = new List<Book>
 {
     new Book
@@ -53,16 +100,50 @@ var books = new List<Book>
     }
 };
 
-var users = new List<User>();
-
-app.MapPost("/api/register", (User user) =>
+/*
+ * REGISTER
+ */
+app.MapPost("/api/register", async (User user) =>
 {
-    if (users.Any(u => u.Username == user.Username))
+    if (string.IsNullOrWhiteSpace(user.Username) ||
+        string.IsNullOrWhiteSpace(user.Password))
     {
-        return Results.BadRequest("Username already exists.");
+        return Results.BadRequest(
+            "Username and password are required.");
     }
 
-    users.Add(user);
+    await using var connection =
+        new NpgsqlConnection(connectionString);
+
+    await connection.OpenAsync();
+
+    var passwordHash =
+        BCrypt.Net.BCrypt.HashPassword(user.Password);
+
+    var command = new NpgsqlCommand(
+        """
+        INSERT INTO users (username, password_hash)
+        VALUES (@username, @passwordHash)
+        ON CONFLICT (username) DO NOTHING;
+        """,
+        connection);
+
+    command.Parameters.AddWithValue(
+        "username",
+        user.Username);
+
+    command.Parameters.AddWithValue(
+        "passwordHash",
+        passwordHash);
+
+    var rowsAffected =
+        await command.ExecuteNonQueryAsync();
+
+    if (rowsAffected == 0)
+    {
+        return Results.BadRequest(
+            "Username already exists.");
+    }
 
     return Results.Ok(new
     {
@@ -70,20 +151,51 @@ app.MapPost("/api/register", (User user) =>
     });
 });
 
-app.MapPost("/api/login", (User loginUser) =>
+/*
+ * LOGIN
+ */
+app.MapPost("/api/login", async (User loginUser) =>
 {
-    var user = users.FirstOrDefault(u =>
-        u.Username == loginUser.Username &&
-        u.Password == loginUser.Password);
+    await using var connection =
+        new NpgsqlConnection(connectionString);
 
-    if (user == null)
+    await connection.OpenAsync();
+
+    var command = new NpgsqlCommand(
+        """
+        SELECT password_hash
+        FROM users
+        WHERE username = @username;
+        """,
+        connection);
+
+    command.Parameters.AddWithValue(
+        "username",
+        loginUser.Username);
+
+    var storedPasswordHash =
+        await command.ExecuteScalarAsync() as string;
+
+    if (storedPasswordHash == null)
+    {
+        return Results.Unauthorized();
+    }
+
+    var passwordIsValid =
+        BCrypt.Net.BCrypt.Verify(
+            loginUser.Password,
+            storedPasswordHash);
+
+    if (!passwordIsValid)
     {
         return Results.Unauthorized();
     }
 
     var claims = new[]
     {
-        new Claim(ClaimTypes.Name, user.Username)
+        new Claim(
+            ClaimTypes.Name,
+            loginUser.Username)
     };
 
     var key = new SymmetricSecurityKey(
@@ -99,7 +211,8 @@ app.MapPost("/api/login", (User loginUser) =>
         signingCredentials: credentials);
 
     var tokenString =
-        new JwtSecurityTokenHandler().WriteToken(token);
+        new JwtSecurityTokenHandler()
+            .WriteToken(token);
 
     return Results.Ok(new
     {
@@ -107,12 +220,18 @@ app.MapPost("/api/login", (User loginUser) =>
     });
 });
 
+/*
+ * GET BOOKS
+ */
 app.MapGet("/api/books", () =>
 {
     return Results.Ok(books);
 })
 .RequireAuthorization();
 
+/*
+ * ADD BOOK
+ */
 app.MapPost("/api/books", (Book book) =>
 {
     book.Id = books.Count == 0
@@ -125,9 +244,14 @@ app.MapPost("/api/books", (Book book) =>
 })
 .RequireAuthorization();
 
-app.MapPut("/api/books/{id}", (int id, Book updatedBook) =>
+/*
+ * EDIT BOOK
+ */
+app.MapPut("/api/books/{id}",
+    (int id, Book updatedBook) =>
 {
-    var book = books.FirstOrDefault(b => b.Id == id);
+    var book =
+        books.FirstOrDefault(b => b.Id == id);
 
     if (book == null)
     {
@@ -136,15 +260,20 @@ app.MapPut("/api/books/{id}", (int id, Book updatedBook) =>
 
     book.Title = updatedBook.Title;
     book.Author = updatedBook.Author;
-    book.PublicationDate = updatedBook.PublicationDate;
+    book.PublicationDate =
+        updatedBook.PublicationDate;
 
     return Results.Ok(book);
 })
 .RequireAuthorization();
 
+/*
+ * DELETE BOOK
+ */
 app.MapDelete("/api/books/{id}", (int id) =>
 {
-    var book = books.FirstOrDefault(b => b.Id == id);
+    var book =
+        books.FirstOrDefault(b => b.Id == id);
 
     if (book == null)
     {
@@ -162,13 +291,17 @@ app.Run();
 class Book
 {
     public int Id { get; set; }
+
     public string Title { get; set; } = "";
+
     public string Author { get; set; } = "";
+
     public string PublicationDate { get; set; } = "";
 }
 
 class User
 {
     public string Username { get; set; } = "";
+
     public string Password { get; set; } = "";
 }
